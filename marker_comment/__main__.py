@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from enum import Enum
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -23,6 +25,109 @@ HASH_EXTENSIONS = {
     ".yml",
     ".zsh",
 }
+SLASH_EXTENSIONS = {
+    ".c",
+    ".cc",
+    ".cjs",
+    ".cpp",
+    ".cs",
+    ".cxx",
+    ".go",
+    ".h",
+    ".hpp",
+    ".java",
+    ".js",
+    ".jsx",
+    ".kt",
+    ".kts",
+    ".mjs",
+    ".rs",
+    ".swift",
+    ".ts",
+    ".tsx",
+}
+BANG_EXTENSIONS = {".f03", ".f08", ".f18", ".f90", ".f95"}
+HTML_EXTENSIONS = {".htm", ".html", ".markdown", ".md", ".svelte", ".vue", ".xml"}
+CSS_EXTENSIONS = {".css", ".less", ".sass", ".scss"}
+LOCKFILE_NAMES = {
+    "Cargo.lock",
+    "Gemfile.lock",
+    "Pipfile.lock",
+    "Podfile.lock",
+    "bun.lock",
+    "bun.lockb",
+    "composer.lock",
+    "flake.lock",
+    "go.sum",
+    "gradle.lockfile",
+    "mix.lock",
+    "npm-shrinkwrap.json",
+    "package-lock.json",
+    "packages.lock.json",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "pubspec.lock",
+    "uv.lock",
+    "yarn.lock",
+}
+VENDORED_SEGMENTS = {
+    "bower_components",
+    "node_modules",
+    "third-party",
+    "third_party",
+    "vendor",
+    "vendors",
+}
+
+
+class CommentSyntax(Enum):
+    HASH_LINE = "hash-line"
+    SLASH_LINE = "slash-line"
+    BANG_LINE = "bang-line"
+    HTML_BLOCK = "html-block"
+    CSS_BLOCK = "css-block"
+
+
+class ExclusionReason(Enum):
+    UNSUPPORTED_SYNTAX = "unsupported comment syntax"
+    FILE_GLOB_MISMATCH = "does not match file-globs"
+    HIDDEN_PATH = "hidden path"
+    LOCKFILE = "lockfile"
+    VENDORED_PATH = "vendored path"
+    NUL_BYTE = "contains NUL byte"
+    SYMLINK = "symlink"
+    SUBMODULE = "Git submodule"
+    NON_REGULAR = "non-regular Git entry"
+    CONSUMER_GLOB = "excluded by glob"
+
+
+@dataclass(frozen=True)
+class GlobPattern:
+    source: str
+    matcher: re.Pattern[str]
+    basename_only: bool
+
+    def matches(self, path: Path) -> bool:
+        candidate = path.name if self.basename_only else path.as_posix()
+        return self.matcher.fullmatch(candidate) is not None
+
+
+@dataclass(frozen=True)
+class EligibleFile:
+    path: Path
+    syntax: CommentSyntax
+
+
+@dataclass(frozen=True)
+class ExcludedFile:
+    path: Path
+    reason: ExclusionReason
+    pattern: str | None = None
+
+    def description(self) -> str:
+        if self.pattern is None:
+            return self.reason.value
+        return f"{self.reason.value} {self.pattern!r}"
 
 
 class ProcessorError(Exception):
@@ -47,13 +152,23 @@ def git(repository: Path, *arguments: str) -> bytes:
     ).stdout
 
 
-def is_hash_comment_file(path: Path) -> bool:
+def comment_syntax_for(path: Path) -> CommentSyntax | None:
     name = path.name
-    return (
+    if (
         path.suffix in HASH_EXTENSIONS
         or name in {"Dockerfile", "Makefile", "GNUmakefile"}
         or name.startswith("Dockerfile.")
-    )
+    ):
+        return CommentSyntax.HASH_LINE
+    if path.suffix in SLASH_EXTENSIONS:
+        return CommentSyntax.SLASH_LINE
+    if path.suffix in BANG_EXTENSIONS:
+        return CommentSyntax.BANG_LINE
+    if path.suffix in HTML_EXTENSIONS:
+        return CommentSyntax.HTML_BLOCK
+    if path.suffix in CSS_EXTENSIONS:
+        return CommentSyntax.CSS_BLOCK
+    return None
 
 
 def render_block(marker_text: str, newline: bytes) -> bytes:
@@ -96,7 +211,125 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate Marker Comment Block changes")
     parser.add_argument("--marker-text", required=True)
     parser.add_argument("--report-only", action="store_true")
+    parser.add_argument("--file-glob", action="append", default=[])
+    parser.add_argument("--exclude-glob", action="append", default=[])
     return parser.parse_args()
+
+
+def validate_glob(pattern: str) -> None:
+    if not pattern:
+        raise ProcessorError(f"invalid glob pattern {pattern!r}: pattern is empty")
+    if pattern.startswith("!"):
+        raise ProcessorError(
+            f"invalid glob pattern {pattern!r}: negation is not supported"
+        )
+    if pattern.endswith("/"):
+        raise ProcessorError(
+            f"invalid glob pattern {pattern!r}: directory-only patterns are not supported"
+        )
+    if "\\" in pattern:
+        raise ProcessorError(
+            f"invalid glob pattern {pattern!r}: backslash escapes are not supported"
+        )
+
+def compile_glob(pattern: str) -> GlobPattern:
+    validate_glob(pattern)
+    rooted = pattern.startswith("/")
+    normalized = pattern[1:] if rooted else pattern
+    basename_only = not rooted and "/" not in normalized
+    regex: list[str] = []
+    index = 0
+    while index < len(normalized):
+        character = normalized[index]
+        if character == "*":
+            is_double_star = (
+                index + 1 < len(normalized)
+                and normalized[index + 1] == "*"
+                and (index == 0 or normalized[index - 1] == "/")
+                and (index + 2 == len(normalized) or normalized[index + 2] == "/")
+            )
+            if is_double_star:
+                index += 2
+                if index < len(normalized):
+                    regex.append("(?:.*/)?")
+                else:
+                    regex.append(".*")
+                    index -= 1
+            else:
+                regex.append("[^/]*")
+        elif character == "?":
+            regex.append("[^/]")
+        elif character == "[":
+            closing_index = normalized.find("]", index + 1)
+            if closing_index == -1:
+                raise ProcessorError(
+                    f"invalid glob pattern {pattern!r}: unclosed character class"
+                )
+            content = normalized[index + 1 : closing_index]
+            if not content or content == "!":
+                raise ProcessorError(
+                    f"invalid glob pattern {pattern!r}: empty character class"
+                )
+            negated = content.startswith("!")
+            if negated:
+                content = content[1:]
+            escaped_content = content.replace("\\", "\\\\")
+            if escaped_content.startswith("^"):
+                escaped_content = "\\" + escaped_content
+            regex.append(
+                "(?!/)[" + ("^" if negated else "") + escaped_content + "]"
+            )
+            index = closing_index
+        else:
+            regex.append(re.escape(character))
+        index += 1
+    try:
+        matcher = re.compile("".join(regex))
+    except re.error as error:
+        raise ProcessorError(f"invalid glob pattern {pattern!r}: {error}") from error
+    return GlobPattern(pattern, matcher, basename_only)
+
+
+def tracked_mode(repository: Path, path: Path) -> str:
+    try:
+        entry = git(
+            repository,
+            "--literal-pathspecs",
+            "ls-files",
+            "--stage",
+            "-z",
+            "--",
+            path.as_posix(),
+        )
+    except subprocess.CalledProcessError as error:
+        detail = error.stderr.decode(errors="replace").strip()
+        raise ProcessorError(
+            f"cannot inspect Git entry for {format_path(path)}: {detail}"
+        ) from error
+    if not entry:
+        raise ProcessorError(f"MR-Added File is not tracked: {format_path(path)}")
+    return entry.split(b" ", 1)[0].decode("ascii")
+
+
+def built_in_exclusion(repository: Path, path: Path) -> ExclusionReason | None:
+    segments = path.parts
+    if any(segment.startswith(".") for segment in segments):
+        return ExclusionReason.HIDDEN_PATH
+    if path.name in LOCKFILE_NAMES:
+        return ExclusionReason.LOCKFILE
+    if any(segment in VENDORED_SEGMENTS for segment in segments):
+        return ExclusionReason.VENDORED_PATH
+
+    mode = tracked_mode(repository, path)
+    if mode in {"100644", "100755"}:
+        if b"\0" in (repository / path).read_bytes():
+            return ExclusionReason.NUL_BYTE
+        return None
+    if mode == "120000":
+        return ExclusionReason.SYMLINK
+    if mode == "160000":
+        return ExclusionReason.SUBMODULE
+    return ExclusionReason.NON_REGULAR
 
 
 def required_environment(name: str) -> str:
@@ -211,17 +444,53 @@ def discover_added_files(configuration: MergeRequestConfiguration) -> list[Path]
 def main() -> int:
     arguments = parse_arguments()
     try:
+        file_globs = [compile_glob(pattern) for pattern in arguments.file_glob]
+        exclude_globs = [compile_glob(pattern) for pattern in arguments.exclude_glob]
         configuration = load_configuration(arguments.marker_text)
         discovered = discover_added_files(configuration)
     except ProcessorError as error:
         print(f"Error: {error}")
         return 2
     repository = configuration.repository
-    eligible = [path for path in discovered if is_hash_comment_file(path)]
-    excluded = [path for path in discovered if path not in eligible]
+    eligible: list[EligibleFile] = []
+    excluded: list[ExcludedFile] = []
+    try:
+        for path in discovered:
+            syntax = comment_syntax_for(path)
+            if syntax is None:
+                excluded.append(
+                    ExcludedFile(path, ExclusionReason.UNSUPPORTED_SYNTAX)
+                )
+            elif file_globs and not any(pattern.matches(path) for pattern in file_globs):
+                excluded.append(
+                    ExcludedFile(path, ExclusionReason.FILE_GLOB_MISMATCH)
+                )
+            else:
+                reason = built_in_exclusion(repository, path)
+                matching_exclusion = next(
+                    (pattern for pattern in exclude_globs if pattern.matches(path)), None
+                )
+                if reason is not None:
+                    excluded.append(ExcludedFile(path, reason))
+                elif matching_exclusion is not None:
+                    excluded.append(
+                        ExcludedFile(
+                            path,
+                            ExclusionReason.CONSUMER_GLOB,
+                            matching_exclusion.source,
+                        )
+                    )
+                else:
+                    eligible.append(EligibleFile(path, syntax))
+    except ProcessorError as error:
+        print(f"Error: {error}")
+        return 2
     changed: list[Path] = []
 
-    for relative_path in eligible:
+    for eligible_file in eligible:
+        if eligible_file.syntax is not CommentSyntax.HASH_LINE:
+            continue
+        relative_path = eligible_file.path
         path = repository / relative_path
         original = path.read_bytes()
         newline = b"\r\n" if b"\r\n" in original else b"\n"
@@ -262,6 +531,13 @@ def main() -> int:
         print("Changed Files")
         for path in changed:
             print(f"- {format_path(path)}")
+    if excluded:
+        print("Excluded MR-Added Files")
+        for excluded_file in excluded:
+            print(
+                f"- {format_path(excluded_file.path)}: {excluded_file.description()}"
+            )
+    if changed:
         artifact_sha = os.environ.get("CI_COMMIT_SHORT_SHA", "unknown")
         print(f"Patch artifact: marker-comment-{artifact_sha} (retained for one week)")
         print("git apply --check marker-comment.patch")

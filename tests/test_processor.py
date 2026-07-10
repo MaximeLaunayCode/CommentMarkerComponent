@@ -8,6 +8,8 @@ import sys
 import tempfile
 import unittest
 
+from marker_comment.__main__ import CommentSyntax, comment_syntax_for
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -358,6 +360,285 @@ class ProcessorWorkflowTests(unittest.TestCase):
         self.assertIn(b"victim.py", patch.read_bytes())
         self.git("--literal-pathspecs", "restore", "--", path)
         self.git("apply", "--check", "marker-comment.patch")
+
+    def test_supported_filename_mapping_is_case_sensitive_and_complete(self) -> None:
+        cases = {
+            **{
+                f"file{extension}": CommentSyntax.HASH_LINE
+                for extension in [
+                    ".sh",
+                    ".bash",
+                    ".zsh",
+                    ".ksh",
+                    ".fish",
+                    ".py",
+                    ".rb",
+                    ".yml",
+                    ".yaml",
+                    ".toml",
+                    ".mk",
+                ]
+            },
+            "Dockerfile": CommentSyntax.HASH_LINE,
+            "Dockerfile.release": CommentSyntax.HASH_LINE,
+            "Makefile": CommentSyntax.HASH_LINE,
+            "GNUmakefile": CommentSyntax.HASH_LINE,
+            **{
+                f"file{extension}": CommentSyntax.SLASH_LINE
+                for extension in [
+                    ".js",
+                    ".jsx",
+                    ".mjs",
+                    ".cjs",
+                    ".ts",
+                    ".tsx",
+                    ".java",
+                    ".c",
+                    ".h",
+                    ".cc",
+                    ".cpp",
+                    ".cxx",
+                    ".hpp",
+                    ".cs",
+                    ".go",
+                    ".kt",
+                    ".kts",
+                    ".swift",
+                    ".rs",
+                ]
+            },
+            **{
+                f"file{extension}": CommentSyntax.BANG_LINE
+                for extension in [".f90", ".f95", ".f03", ".f08", ".f18"]
+            },
+            **{
+                f"file{extension}": CommentSyntax.HTML_BLOCK
+                for extension in [
+                    ".html",
+                    ".htm",
+                    ".xml",
+                    ".md",
+                    ".markdown",
+                    ".vue",
+                    ".svelte",
+                ]
+            },
+            **{
+                f"file{extension}": CommentSyntax.CSS_BLOCK
+                for extension in [".css", ".scss", ".sass", ".less"]
+            },
+            "legacy.f": None,
+            "legacy.for": None,
+            "legacy.ftn": None,
+            "script.PY": None,
+            "dockerfile": None,
+            "unsupported.txt": None,
+        }
+
+        for filename, expected in cases.items():
+            with self.subTest(filename=filename):
+                self.assertEqual(comment_syntax_for(Path(filename)), expected)
+
+    def test_file_globs_cannot_expand_an_unsupported_syntax(self) -> None:
+        self.add_file_at_head("notes.txt", "consumer notes\n")
+
+        result = self.run_processor(
+            "--marker-text", "Managed by platform", "--file-glob", "*.txt"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(
+            "Summary: discovered=1 eligible=0 changed=0 excluded=1 errored=0",
+            result.stdout,
+        )
+        self.assertIn("- notes.txt: unsupported comment syntax", result.stdout)
+        self.assertEqual(
+            (self.repository / "notes.txt").read_text(encoding="utf-8"),
+            "consumer notes\n",
+        )
+
+    def test_all_supported_syntax_families_enter_workflow_eligibility(self) -> None:
+        paths = ["hash.py", "slash.ts", "bang.f90", "page.html", "style.css"]
+        for path in paths:
+            self.add_file_at_head(path, f"original {path}\n")
+
+        result = self.run_processor("--marker-text", "Managed by platform")
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(
+            "Summary: discovered=5 eligible=5 changed=1 excluded=0 errored=0",
+            result.stdout,
+        )
+        self.assertNotIn("Excluded MR-Added Files", result.stdout)
+        self.assertTrue(
+            (self.repository / "hash.py")
+            .read_bytes()
+            .startswith(b"# MARKER-COMMENT: BEGIN\n")
+        )
+        for path in paths[1:]:
+            self.assertEqual(
+                (self.repository / path).read_text(encoding="utf-8"),
+                f"original {path}\n",
+            )
+
+    def test_invalid_globs_are_rejected_before_processing_and_name_the_pattern(
+        self,
+    ) -> None:
+        self.add_file_at_head("scripts/check.py", "print('checked')\n")
+        content_before = (self.repository / "scripts/check.py").read_bytes()
+        status_before = self.git("status", "--short").stdout
+        cases = [
+            ("--file-glob", "!scripts/**"),
+            ("--file-glob", "scripts/"),
+            ("--exclude-glob", "scripts/[abc"),
+            ("--exclude-glob", "scripts/[]"),
+            ("--exclude-glob", r"scripts/\[literal.py"),
+            ("--exclude-glob", ""),
+        ]
+
+        for option, pattern in cases:
+            with self.subTest(pattern=pattern):
+                result = self.run_processor(
+                    "--marker-text", "Managed by platform", option, pattern
+                )
+
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn(repr(pattern), result.stdout)
+                self.assertEqual(
+                    (self.repository / "scripts/check.py").read_bytes(), content_before
+                )
+                self.assertEqual(self.git("status", "--short").stdout, status_before)
+                self.assertFalse((self.repository / "marker-comment.patch").exists())
+
+    def test_file_globs_narrow_and_exclude_globs_win_with_wildmatch_semantics(
+        self,
+    ) -> None:
+        paths = [
+            "root.py",
+            "nested/root.py",
+            "src/app.py",
+            "src/app1.py",
+            "src/appA.py",
+            "src/nested/skip.py",
+            "deep/app3.py",
+            "deep/src/app2.py",
+            "docs/readme.py",
+            "other/skip.py",
+        ]
+        for path in paths:
+            self.add_file_at_head(path, f"original {path}\n")
+
+        result = self.run_processor(
+            "--marker-text",
+            "Managed by platform",
+            "--file-glob",
+            "/root.py",
+            "--file-glob",
+            "src/*.py",
+            "--file-glob",
+            "deep/**/app?.py",
+            "--file-glob",
+            "docs/readme.[p]y",
+            "--exclude-glob",
+            "app[1A].py",
+            "--exclude-glob",
+            "/docs/readme.py",
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(
+            "Summary: discovered=10 eligible=4 changed=4 excluded=6 errored=0",
+            result.stdout,
+        )
+        for path in ["root.py", "src/app.py", "deep/app3.py", "deep/src/app2.py"]:
+            self.assertTrue(
+                (self.repository / path)
+                .read_bytes()
+                .startswith(b"# MARKER-COMMENT: BEGIN\n"),
+                path,
+            )
+        for path in [
+            "src/app1.py",
+            "src/appA.py",
+            "src/nested/skip.py",
+            "nested/root.py",
+            "docs/readme.py",
+            "other/skip.py",
+        ]:
+            self.assertEqual(
+                (self.repository / path).read_text(encoding="utf-8"),
+                f"original {path}\n",
+            )
+        self.assertIn("- docs/readme.py: excluded by glob '/docs/readme.py'", result.stdout)
+        self.assertIn("- src/app1.py: excluded by glob 'app[1A].py'", result.stdout)
+        self.assertIn("- src/nested/skip.py: does not match file-globs", result.stdout)
+
+    def test_builtin_exclusions_use_stable_precedence_and_do_not_infer_size(
+        self,
+    ) -> None:
+        self.add_file_at_head(".config/tool.py", "hidden\n")
+        self.add_file_at_head("src/vendor/tool.py", "vendored\n")
+        self.add_file_at_head("pnpm-lock.yaml", "lockfileVersion: 9\n")
+
+        binary_path = self.repository / "binary.py"
+        binary_path.write_bytes(b"before\0after\n")
+        self.git("add", "binary.py")
+        self.git("commit", "--quiet", "-m", "add binary-like Python file")
+
+        symlink = self.repository / "linked.py"
+        symlink.symlink_to("README.txt")
+        self.git("add", "linked.py")
+        self.git("commit", "--quiet", "-m", "add symlink")
+
+        large_content = "x" * (256 * 1024)
+        self.add_file_at_head("large.py", large_content)
+
+        result = self.run_processor(
+            "--marker-text",
+            "Managed by platform",
+            "--exclude-glob",
+            "/.config/**",
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(
+            "Summary: discovered=6 eligible=1 changed=1 excluded=5 errored=0",
+            result.stdout,
+        )
+        self.assertIn("- .config/tool.py: hidden path", result.stdout)
+        self.assertIn("- binary.py: contains NUL byte", result.stdout)
+        self.assertIn("- linked.py: symlink", result.stdout)
+        self.assertIn("- pnpm-lock.yaml: lockfile", result.stdout)
+        self.assertIn("- src/vendor/tool.py: vendored path", result.stdout)
+        self.assertEqual((self.repository / "binary.py").read_bytes(), b"before\0after\n")
+        self.assertTrue((self.repository / "linked.py").is_symlink())
+        self.assertTrue(
+            (self.repository / "large.py")
+            .read_bytes()
+            .startswith(b"# MARKER-COMMENT: BEGIN\n")
+        )
+        self.assertTrue((self.repository / "marker-comment.patch").exists())
+
+    def test_git_submodule_entry_is_excluded_without_reading_the_worktree(self) -> None:
+        self.git(
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{self.base},module.py",
+        )
+        self.git("commit", "--quiet", "-m", "add gitlink")
+        (self.repository / "module.py").mkdir()
+
+        result = self.run_processor("--marker-text", "Managed by platform")
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(
+            "Summary: discovered=1 eligible=0 changed=0 excluded=1 errored=0",
+            result.stdout,
+        )
+        self.assertIn("- module.py: Git submodule", result.stdout)
+        self.assertIn("No Eligible MR-Added Files found.", result.stdout)
+        self.assertFalse((self.repository / "marker-comment.patch").exists())
 
     def test_enforcement_generates_an_apply_ready_patch_for_an_added_hash_comment_file(
         self,
