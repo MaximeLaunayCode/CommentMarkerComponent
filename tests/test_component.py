@@ -33,12 +33,12 @@ def compile_component(
     job = deepcopy(raw_body["$[[ inputs.job-name ]]"])
     job["stage"] = stage
     job["image"] = job["image"].replace("$[[ component.version ]]", version)
-    job["variables"]["MARKER_COMMENT_FILE_GLOBS"] = (
-        "serialized:" + json.dumps(file_globs or [])
-    )
-    job["variables"]["MARKER_COMMENT_EXCLUDE_GLOBS"] = (
-        "serialized:" + json.dumps(exclude_globs or [])
-    )
+    serialized_globs = {
+        "MARKER_COMMENT_FILE_GLOBS": file_globs or [],
+        "MARKER_COMMENT_EXCLUDE_GLOBS": exclude_globs or [],
+    }
+    for variable, patterns in serialized_globs.items():
+        job["variables"][variable] = "serialized:" + json.dumps(patterns)
     return {job_name: job}
 
 
