@@ -79,7 +79,7 @@ VENDORED_SEGMENTS = {
     "vendors",
 }
 XML_DECLARATION = re.compile(
-    br"\A<\?xml[ \t\r\n]+version[ \t\r\n]*=[ \t\r\n]*"
+    br"\A(?:\xef\xbb\xbf)?<\?xml[ \t\r\n]+version[ \t\r\n]*=[ \t\r\n]*"
     br'''(?:"1\.[0-9]+"|'1\.[0-9]+')'''
     br'''(?:[ \t\r\n]+encoding[ \t\r\n]*=[ \t\r\n]*(?:"[A-Za-z][A-Za-z0-9._-]*"|'[A-Za-z][A-Za-z0-9._-]*'))?'''
     br'''(?:[ \t\r\n]+standalone[ \t\r\n]*=[ \t\r\n]*(?:"(?:yes|no)"|'(?:yes|no)'))?'''

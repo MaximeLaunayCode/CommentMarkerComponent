@@ -792,6 +792,10 @@ class ProcessorWorkflowTests(unittest.TestCase):
                 b'<?xml version="1.0"\r\n encoding="UTF-8"?>\r\n'
                 b"<root>kept</root>\r\n"
             ),
+            "bom.xml": (
+                b'\xef\xbb\xbf<?xml version="1.0" encoding="UTF-8"?>\n'
+                b"<root>kept</root>\n"
+            ),
             "later.xml": b"<root/>\n<?xml declaration-like?>\n",
             "leading-like.xml": b"<?xml nonsense?>\n<root/>\n",
             "empty.css": b"",
@@ -819,6 +823,12 @@ class ProcessorWorkflowTests(unittest.TestCase):
             b'<?xml version="1.0"\r\n encoding="UTF-8"?>\r\n'
             + html_crlf
             + b"<root>kept</root>\r\n",
+        )
+        self.assertEqual(
+            (self.repository / "bom.xml").read_bytes(),
+            b'\xef\xbb\xbf<?xml version="1.0" encoding="UTF-8"?>\n'
+            + html_lf
+            + b"<root>kept</root>\n",
         )
         self.assertEqual(
             (self.repository / "later.xml").read_bytes(),

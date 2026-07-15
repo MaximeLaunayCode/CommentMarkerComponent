@@ -22,3 +22,6 @@ Resolved by commits `8c05a72` (`Render safe HTML and CSS block comments`) and
 `8fde4d6` (`Address block comment review findings`). The complete processor test
 suite verifies canonical rendering, XML placement, byte preservation,
 syntax-safety errors, and apply-ready partial patches and passes.
+
+A final spec review added byte-exact coverage for UTF-8 BOM-prefixed XML and
+keeps both the BOM and leading declaration ahead of the Marker Comment Block.
