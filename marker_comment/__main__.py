@@ -78,6 +78,13 @@ VENDORED_SEGMENTS = {
     "vendor",
     "vendors",
 }
+XML_DECLARATION = re.compile(
+    br"\A<\?xml[ \t\r\n]+version[ \t\r\n]*=[ \t\r\n]*"
+    br'''(?:"1\.[0-9]+"|'1\.[0-9]+')'''
+    br'''(?:[ \t\r\n]+encoding[ \t\r\n]*=[ \t\r\n]*(?:"[A-Za-z][A-Za-z0-9._-]*"|'[A-Za-z][A-Za-z0-9._-]*'))?'''
+    br'''(?:[ \t\r\n]+standalone[ \t\r\n]*=[ \t\r\n]*(?:"(?:yes|no)"|'(?:yes|no)'))?'''
+    br"[ \t\r\n]*\?>"
+)
 
 
 class CommentSyntax(Enum):
@@ -142,17 +149,38 @@ class ProcessorError(Exception):
 
 
 @dataclass(frozen=True)
-class FileError:
-    path: Path
-    message: str
-
-
-@dataclass(frozen=True)
 class MergeRequestConfiguration:
     repository: Path
     diff_base_sha: str
     target_branch: str
     source_head_sha: str
+
+
+@dataclass(frozen=True)
+class ConfiguredSentinels:
+    begin: str
+    end: str
+
+    def validate(self) -> None:
+        for name, sentinel in (("begin sentinel", self.begin), ("end sentinel", self.end)):
+            if not sentinel:
+                raise ProcessorError(f"{name} must not be empty")
+            if sentinel != sentinel.strip():
+                raise ProcessorError(
+                    f"{name} must not have leading or trailing whitespace"
+                )
+            if "\0" in sentinel:
+                raise ProcessorError(f"{name} must not contain a NUL byte")
+            if sentinel.splitlines() != [sentinel]:
+                raise ProcessorError(f"{name} must be a single line")
+        if self.begin == self.end:
+            raise ProcessorError("begin and end sentinels must be distinct")
+
+
+@dataclass(frozen=True)
+class SyntaxSafetyError:
+    path: Path
+    message: str
 
 
 def git(repository: Path, *arguments: str) -> bytes:
@@ -192,35 +220,33 @@ def render_block(
     marker_text: str,
     newline: bytes,
     syntax: CommentSyntax,
-    begin_sentinel: str,
-    end_sentinel: str,
+    sentinels: ConfiguredSentinels,
 ) -> bytes:
     lines = normalized_marker_lines(marker_text)
     if syntax is CommentSyntax.HTML_BLOCK:
-        rendered = [f"<!-- {begin_sentinel}"]
+        rendered = [f"<!-- {sentinels.begin}"]
         rendered.extend(f"     {line}" if line else "    " for line in lines)
-        rendered.append(f"     {end_sentinel} -->")
+        rendered.append(f"     {sentinels.end} -->")
         return newline.join(line.encode() for line in rendered) + newline
     if syntax is CommentSyntax.CSS_BLOCK:
-        rendered = [f"/* {begin_sentinel}"]
+        rendered = [f"/* {sentinels.begin}"]
         rendered.extend(f" * {line}" if line else " *" for line in lines)
-        rendered.append(f" * {end_sentinel} */")
+        rendered.append(f" * {sentinels.end} */")
         return newline.join(line.encode() for line in rendered) + newline
 
     prefix = LINE_COMMENT_PREFIXES[syntax]
-    rendered = [f"{prefix} {begin_sentinel}"]
+    rendered = [f"{prefix} {sentinels.begin}"]
     rendered.extend(
         f"{prefix} {line}" if line else prefix for line in lines
     )
-    rendered.append(f"{prefix} {end_sentinel}")
+    rendered.append(f"{prefix} {sentinels.end}")
     return newline.join(line.encode() for line in rendered) + newline
 
 
 def syntax_safety_error(
     marker_text: str,
     syntax: CommentSyntax,
-    begin_sentinel: str,
-    end_sentinel: str,
+    sentinels: ConfiguredSentinels,
 ) -> str | None:
     forbidden = {
         CommentSyntax.HTML_BLOCK: "--",
@@ -230,7 +256,7 @@ def syntax_safety_error(
         return None
     if any(
         forbidden in configured
-        for configured in (begin_sentinel, end_sentinel, marker_text)
+        for configured in (sentinels.begin, sentinels.end, marker_text)
     ):
         return f"comment syntax does not allow {forbidden!r}"
     return None
@@ -241,25 +267,15 @@ def insertion_position(content: bytes) -> int:
         line_end = content.find(b"\n")
         return len(content) if line_end == -1 else line_end + 1
 
-    if content.startswith(b"<?xml") and len(content) > 5 and content[5:6].isspace():
-        declaration_end = content.find(b"?>", 6)
-        first_line_end = content.find(b"\n")
-        if declaration_end != -1 and (
-            first_line_end == -1 or declaration_end < first_line_end
-        ):
-            position = declaration_end + 2
-            if content[position : position + 2] == b"\r\n":
-                return position + 2
-            if content[position : position + 1] in {b"\r", b"\n"}:
-                return position + 1
-            return position
+    declaration = XML_DECLARATION.match(content)
+    if declaration is not None:
+        position = declaration.end()
+        if content[position : position + 2] == b"\r\n":
+            return position + 2
+        if content[position : position + 1] in {b"\r", b"\n"}:
+            return position + 1
+        return position
     return 0
-
-
-def has_leading_preamble(content: bytes) -> bool:
-    return content.startswith(b"#!") or insertion_position(content) > 0
-
-
 def write_atomically(path: Path, content: bytes) -> None:
     with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temporary_file:
         temporary_file.write(content)
@@ -290,23 +306,6 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--begin-sentinel", default="MARKER-COMMENT: BEGIN")
     parser.add_argument("--end-sentinel", default="MARKER-COMMENT: END")
     return parser.parse_args()
-
-
-def validate_sentinels(begin_sentinel: str, end_sentinel: str) -> None:
-    for name, sentinel in (
-        ("begin sentinel", begin_sentinel),
-        ("end sentinel", end_sentinel),
-    ):
-        if not sentinel:
-            raise ProcessorError(f"{name} must not be empty")
-        if sentinel != sentinel.strip():
-            raise ProcessorError(f"{name} must not have leading or trailing whitespace")
-        if "\0" in sentinel:
-            raise ProcessorError(f"{name} must not contain a NUL byte")
-        if sentinel.splitlines() != [sentinel]:
-            raise ProcessorError(f"{name} must be a single line")
-    if begin_sentinel == end_sentinel:
-        raise ProcessorError("begin and end sentinels must be distinct")
 
 
 def validate_glob(pattern: str) -> None:
@@ -537,7 +536,10 @@ def discover_added_files(configuration: MergeRequestConfiguration) -> list[Path]
 def main() -> int:
     arguments = parse_arguments()
     try:
-        validate_sentinels(arguments.begin_sentinel, arguments.end_sentinel)
+        sentinels = ConfiguredSentinels(
+            arguments.begin_sentinel, arguments.end_sentinel
+        )
+        sentinels.validate()
         file_globs = [compile_glob(pattern) for pattern in arguments.file_glob]
         exclude_globs = [compile_glob(pattern) for pattern in arguments.exclude_glob]
         configuration = load_configuration(arguments.marker_text)
@@ -580,7 +582,7 @@ def main() -> int:
         print(f"Error: {error}")
         return 2
     changed: list[Path] = []
-    errors: list[FileError] = []
+    errors: list[SyntaxSafetyError] = []
 
     for eligible_file in eligible:
         relative_path = eligible_file.path
@@ -589,25 +591,23 @@ def main() -> int:
         safety_error = syntax_safety_error(
             arguments.marker_text,
             eligible_file.syntax,
-            arguments.begin_sentinel,
-            arguments.end_sentinel,
+            sentinels,
         )
         if safety_error is not None:
-            errors.append(FileError(relative_path, safety_error))
+            errors.append(SyntaxSafetyError(relative_path, safety_error))
             continue
         newline = b"\r\n" if b"\r\n" in original else b"\n"
         block = render_block(
             arguments.marker_text,
             newline,
             eligible_file.syntax,
-            arguments.begin_sentinel,
-            arguments.end_sentinel,
+            sentinels,
         )
         position = insertion_position(original)
         preamble_separator = (
             newline
             if (
-                has_leading_preamble(original)
+                position > 0
                 and position == len(original)
                 and b"\n" not in original
             )

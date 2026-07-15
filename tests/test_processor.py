@@ -788,8 +788,12 @@ class ProcessorWorkflowTests(unittest.TestCase):
         self,
     ) -> None:
         fixtures = {
-            "document.xml": b'<?xml version="1.0"?>\r\n<root>kept</root>\r\n',
+            "document.xml": (
+                b'<?xml version="1.0"\r\n encoding="UTF-8"?>\r\n'
+                b"<root>kept</root>\r\n"
+            ),
             "later.xml": b"<root/>\n<?xml declaration-like?>\n",
+            "leading-like.xml": b"<?xml nonsense?>\n<root/>\n",
             "empty.css": b"",
             "no-terminal.html": b"<main>kept</main>",
         }
@@ -812,13 +816,17 @@ class ProcessorWorkflowTests(unittest.TestCase):
         html_crlf = html_lf.replace(b"\n", b"\r\n")
         self.assertEqual(
             (self.repository / "document.xml").read_bytes(),
-            b'<?xml version="1.0"?>\r\n'
+            b'<?xml version="1.0"\r\n encoding="UTF-8"?>\r\n'
             + html_crlf
             + b"<root>kept</root>\r\n",
         )
         self.assertEqual(
             (self.repository / "later.xml").read_bytes(),
             html_lf + fixtures["later.xml"],
+        )
+        self.assertEqual(
+            (self.repository / "leading-like.xml").read_bytes(),
+            html_lf + fixtures["leading-like.xml"],
         )
         self.assertEqual(
             (self.repository / "empty.css").read_bytes(),
@@ -834,7 +842,7 @@ class ProcessorWorkflowTests(unittest.TestCase):
             html_lf + fixtures["no-terminal.html"],
         )
 
-    def test_unsafe_block_content_errors_per_file_and_keeps_a_partial_patch(
+    def test_unsafe_sentinels_and_managed_marker_body_keep_a_partial_patch(
         self,
     ) -> None:
         fixtures = {
