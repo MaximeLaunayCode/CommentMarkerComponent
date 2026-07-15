@@ -499,6 +499,15 @@ def parse_serialized_globs(value: str) -> list[str]:
     return globs
 
 
+def compile_component_globs(
+    repeated_patterns: list[str], serialized_patterns: list[str]
+) -> list[GlobPattern]:
+    return [
+        compile_glob(pattern)
+        for pattern in [*repeated_patterns, *serialized_patterns]
+    ]
+
+
 def validate_glob(pattern: str) -> None:
     if not pattern:
         raise ProcessorError(f"invalid glob pattern {pattern!r}: pattern is empty")
@@ -731,14 +740,12 @@ def main() -> int:
             arguments.begin_sentinel, arguments.end_sentinel
         )
         sentinels.validate()
-        file_globs = [
-            compile_glob(pattern)
-            for pattern in [*arguments.file_glob, *arguments.file_globs]
-        ]
-        exclude_globs = [
-            compile_glob(pattern)
-            for pattern in [*arguments.exclude_glob, *arguments.exclude_globs]
-        ]
+        file_globs = compile_component_globs(
+            arguments.file_glob, arguments.file_globs
+        )
+        exclude_globs = compile_component_globs(
+            arguments.exclude_glob, arguments.exclude_globs
+        )
         configuration = load_configuration(arguments.marker_text)
         discovered = discover_added_files(configuration)
     except ProcessorError as error:

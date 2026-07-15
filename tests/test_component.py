@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
+import json
 import unittest
 
 import yaml
@@ -19,13 +21,25 @@ def load_template() -> tuple[dict[str, object], dict[str, object]]:
     return documents[0], documents[1]
 
 
-def compile_component(*, job_name: str, stage: str, version: str) -> dict[str, object]:
-    source = TEMPLATE.read_text(encoding="utf-8")
-    body = source.split("\n---\n", 1)[1]
-    body = body.replace("$[[ inputs.job-name ]]", job_name)
-    body = body.replace("$[[ inputs.stage ]]", stage)
-    body = body.replace("$[[ component.version ]]", version)
-    return yaml.safe_load(body)
+def compile_component(
+    *,
+    job_name: str,
+    stage: str,
+    version: str,
+    file_globs: list[str] | None = None,
+    exclude_globs: list[str] | None = None,
+) -> dict[str, object]:
+    _, raw_body = load_template()
+    job = deepcopy(raw_body["$[[ inputs.job-name ]]"])
+    job["stage"] = stage
+    job["image"] = job["image"].replace("$[[ component.version ]]", version)
+    job["variables"]["MARKER_COMMENT_FILE_GLOBS"] = (
+        "serialized:" + json.dumps(file_globs or [])
+    )
+    job["variables"]["MARKER_COMMENT_EXCLUDE_GLOBS"] = (
+        "serialized:" + json.dumps(exclude_globs or [])
+    )
+    return {job_name: job}
 
 
 class PublicComponentContractTests(unittest.TestCase):
@@ -76,7 +90,14 @@ class PublicComponentContractTests(unittest.TestCase):
             job["rules"],
             [{"if": '$CI_PIPELINE_SOURCE == "merge_request_event"'}],
         )
-        self.assertEqual(job["variables"], {"GIT_DEPTH": "0"})
+        self.assertEqual(
+            job["variables"],
+            {
+                "GIT_DEPTH": "0",
+                "MARKER_COMMENT_FILE_GLOBS": "serialized:[]",
+                "MARKER_COMMENT_EXCLUDE_GLOBS": "serialized:[]",
+            },
+        )
         self.assertEqual(
             job["artifacts"],
             {
@@ -94,7 +115,11 @@ class PublicComponentContractTests(unittest.TestCase):
 
     def test_custom_fixture_changes_only_the_public_job_name_and_stage(self) -> None:
         compiled = compile_component(
-            job_name="policy-marker", stage="policy", version="2.0.1"
+            job_name="policy-marker",
+            stage="policy",
+            version="2.0.1",
+            file_globs=["src/**/*.py", "*.sh"],
+            exclude_globs=["vendor/**"],
         )
 
         self.assertEqual(list(compiled), ["policy-marker"])
@@ -102,13 +127,25 @@ class PublicComponentContractTests(unittest.TestCase):
         self.assertTrue(
             compiled["policy-marker"]["image"].endswith(":2.0.1")
         )
+        self.assertEqual(
+            compiled["policy-marker"]["variables"]["MARKER_COMMENT_FILE_GLOBS"],
+            'serialized:["src/**/*.py", "*.sh"]',
+        )
+        self.assertEqual(
+            compiled["policy-marker"]["variables"]["MARKER_COMMENT_EXCLUDE_GLOBS"],
+            'serialized:["vendor/**"]',
+        )
 
     def test_job_invokes_only_the_image_internal_processor_command(self) -> None:
         _, body = load_template()
-        job = body["$[[ inputs.job-name ]]" ]
+        job = body["$[[ inputs.job-name ]]"]
 
         script = "\n".join(job["script"])
         self.assertIn("marker-comment-process", script)
+        self.assertIn('"${MARKER_COMMENT_FILE_GLOBS#serialized:}"', script)
+        self.assertIn('"${MARKER_COMMENT_EXCLUDE_GLOBS#serialized:}"', script)
+        self.assertNotIn("$[[ inputs.file-globs ]]", script)
+        self.assertNotIn("$[[ inputs.exclude-globs ]]", script)
         self.assertNotIn("python", script)
         self.assertNotIn("CI_REGISTRY_IMAGE", job["image"])
         self.assertNotIn("$CI_PROJECT_DIR/", script)

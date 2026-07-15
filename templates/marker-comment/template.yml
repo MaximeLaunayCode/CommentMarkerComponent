@@ -40,13 +40,15 @@ spec:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
   variables:
     GIT_DEPTH: "0"
+    MARKER_COMMENT_FILE_GLOBS: "serialized:$[[ inputs.file-globs ]]"
+    MARKER_COMMENT_EXCLUDE_GLOBS: "serialized:$[[ inputs.exclude-globs ]]"
   script:
     - >-
       marker-comment-process
       --marker-text $[[ inputs.marker-text | posix_escape ]]
       --fail-when-patch-needed $[[ inputs.fail-when-patch-needed ]]
-      --file-globs "$[[ inputs.file-globs ]]"
-      --exclude-globs "$[[ inputs.exclude-globs ]]"
+      --file-globs "${MARKER_COMMENT_FILE_GLOBS#serialized:}"
+      --exclude-globs "${MARKER_COMMENT_EXCLUDE_GLOBS#serialized:}"
       --begin-sentinel $[[ inputs.begin-sentinel | posix_escape ]]
       --end-sentinel $[[ inputs.end-sentinel | posix_escape ]]
   artifacts:
