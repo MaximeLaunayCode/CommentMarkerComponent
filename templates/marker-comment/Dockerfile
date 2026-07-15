@@ -6,4 +6,3 @@ WORKDIR /opt/marker-comment
 COPY marker_comment ./marker_comment
 COPY templates/marker-comment/marker-comment-process /usr/local/bin/marker-comment-process
 RUN chmod 0555 /usr/local/bin/marker-comment-process
-
