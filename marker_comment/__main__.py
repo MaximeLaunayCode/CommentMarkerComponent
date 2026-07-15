@@ -88,6 +88,13 @@ class CommentSyntax(Enum):
     CSS_BLOCK = "css-block"
 
 
+LINE_COMMENT_PREFIXES = {
+    CommentSyntax.HASH_LINE: "#",
+    CommentSyntax.SLASH_LINE: "//",
+    CommentSyntax.BANG_LINE: "!",
+}
+
+
 class ExclusionReason(Enum):
     UNSUPPORTED_SYNTAX = "unsupported comment syntax"
     FILE_GLOB_MISMATCH = "does not match file-globs"
@@ -171,11 +178,14 @@ def comment_syntax_for(path: Path) -> CommentSyntax | None:
     return None
 
 
-def render_block(marker_text: str, newline: bytes) -> bytes:
+def render_block(marker_text: str, newline: bytes, syntax: CommentSyntax) -> bytes:
+    prefix = LINE_COMMENT_PREFIXES[syntax]
     lines = marker_text.splitlines()
-    rendered = ["# MARKER-COMMENT: BEGIN"]
-    rendered.extend(f"# {line.rstrip()}" if line.rstrip() else "#" for line in lines)
-    rendered.append("# MARKER-COMMENT: END")
+    rendered = [f"{prefix} MARKER-COMMENT: BEGIN"]
+    rendered.extend(
+        f"{prefix} {line.rstrip()}" if line.rstrip() else prefix for line in lines
+    )
+    rendered.append(f"{prefix} MARKER-COMMENT: END")
     return newline.join(line.encode() for line in rendered) + newline
 
 
@@ -488,18 +498,34 @@ def main() -> int:
     changed: list[Path] = []
 
     for eligible_file in eligible:
-        if eligible_file.syntax is not CommentSyntax.HASH_LINE:
+        if eligible_file.syntax not in LINE_COMMENT_PREFIXES:
             continue
         relative_path = eligible_file.path
         path = repository / relative_path
         original = path.read_bytes()
         newline = b"\r\n" if b"\r\n" in original else b"\n"
-        block = render_block(arguments.marker_text, newline)
+        block = render_block(arguments.marker_text, newline, eligible_file.syntax)
         position = insertion_position(original)
+        shebang_separator = (
+            newline
+            if (
+                original.startswith(b"#!")
+                and position == len(original)
+                and b"\n" not in original
+            )
+            else b""
+        )
+        placed_block = shebang_separator + (
+            block[: -len(newline)] if shebang_separator else block
+        )
+        content_at_position = original[position:]
+        block_is_canonical = content_at_position.startswith(placed_block) or (
+            not shebang_separator and content_at_position == block[: -len(newline)]
+        )
         candidate = (
             original
-            if original[position:].startswith(block)
-            else original[:position] + block + original[position:]
+            if block_is_canonical
+            else original[:position] + placed_block + original[position:]
         )
         if candidate != original:
             path.write_bytes(candidate)

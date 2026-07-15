@@ -51,6 +51,17 @@ class ProcessorWorkflowTests(unittest.TestCase):
         self.git("--literal-pathspecs", "add", path)
         self.git("commit", "--quiet", "-m", f"add {path}")
 
+    def add_bytes_at_head(
+        self, path: str, content: bytes, *, executable: bool = False
+    ) -> None:
+        destination = self.repository / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+        if executable:
+            destination.chmod(destination.stat().st_mode | stat.S_IXUSR)
+        self.git("--literal-pathspecs", "add", path)
+        self.git("commit", "--quiet", "-m", f"add {path}")
+
     def run_processor(
         self, *arguments: str, environment_overrides: dict[str, str | None] | None = None
     ) -> subprocess.CompletedProcess[str]:
@@ -466,20 +477,256 @@ class ProcessorWorkflowTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn(
-            "Summary: discovered=5 eligible=5 changed=1 excluded=0 errored=0",
+            "Summary: discovered=5 eligible=5 changed=3 excluded=0 errored=0",
             result.stdout,
         )
         self.assertNotIn("Excluded MR-Added Files", result.stdout)
-        self.assertTrue(
-            (self.repository / "hash.py")
-            .read_bytes()
-            .startswith(b"# MARKER-COMMENT: BEGIN\n")
-        )
-        for path in paths[1:]:
+        for path, prefix in {
+            "hash.py": b"#",
+            "slash.ts": b"//",
+            "bang.f90": b"!",
+        }.items():
+            self.assertTrue(
+                (self.repository / path).read_bytes().startswith(
+                    prefix + b" MARKER-COMMENT: BEGIN\n"
+                )
+            )
+        for path in paths[3:]:
             self.assertEqual(
                 (self.repository / path).read_text(encoding="utf-8"),
                 f"original {path}\n",
             )
+
+    def test_line_comment_families_render_their_assigned_prefixes(self) -> None:
+        cases = {
+            "hash.py": "#",
+            "slash.ts": "//",
+            "bang.f90": "!",
+        }
+        for path in cases:
+            self.add_file_at_head(path, f"original {path}\n")
+
+        result = self.run_processor("--marker-text", "Managed by platform")
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(
+            "Summary: discovered=3 eligible=3 changed=3 excluded=0 errored=0",
+            result.stdout,
+        )
+        for path, prefix in cases.items():
+            with self.subTest(path=path):
+                self.assertEqual(
+                    (self.repository / path).read_text(encoding="utf-8"),
+                    f"{prefix} MARKER-COMMENT: BEGIN\n"
+                    f"{prefix} Managed by platform\n"
+                    f"{prefix} MARKER-COMMENT: END\n"
+                    f"original {path}\n",
+                )
+
+    def test_managed_marker_body_uses_universal_lines_without_a_terminal_blank(
+        self,
+    ) -> None:
+        self.add_file_at_head("src/app.ts", "const answer = 42;\n")
+
+        result = self.run_processor(
+            "--marker-text", "  first  \r\n\r\n\tsecond\t \rthird\n"
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(
+            (self.repository / "src/app.ts").read_bytes(),
+            b"// MARKER-COMMENT: BEGIN\n"
+            b"//   first\n"
+            b"//\n"
+            b"// \tsecond\n"
+            b"// third\n"
+            b"// MARKER-COMMENT: END\n"
+            b"const answer = 42;\n",
+        )
+
+    def test_line_comment_rendering_preserves_newlines_content_and_modes(self) -> None:
+        fixtures = {
+            "crlf.ts": b"const crlf = true;\r\n",
+            "empty.f90": b"",
+            "no-terminal.py": b"print('no terminal newline')",
+            "later-shebang.py": b"print('first')\n#!/usr/bin/python\n",
+        }
+        for path, content in fixtures.items():
+            self.add_bytes_at_head(path, content)
+        self.add_bytes_at_head(
+            "bin/tool.ts",
+            b"#!/usr/bin/env node\r\nconsole.log('tool');\r\n",
+            executable=True,
+        )
+        executable_mode = stat.S_IMODE((self.repository / "bin/tool.ts").stat().st_mode)
+
+        result = self.run_processor("--marker-text", "Managed")
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(
+            (self.repository / "crlf.ts").read_bytes(),
+            b"// MARKER-COMMENT: BEGIN\r\n"
+            b"// Managed\r\n"
+            b"// MARKER-COMMENT: END\r\n"
+            + fixtures["crlf.ts"],
+        )
+        self.assertEqual(
+            (self.repository / "empty.f90").read_bytes(),
+            b"! MARKER-COMMENT: BEGIN\n"
+            b"! Managed\n"
+            b"! MARKER-COMMENT: END\n",
+        )
+        self.assertEqual(
+            (self.repository / "no-terminal.py").read_bytes(),
+            b"# MARKER-COMMENT: BEGIN\n"
+            b"# Managed\n"
+            b"# MARKER-COMMENT: END\n"
+            + fixtures["no-terminal.py"],
+        )
+        self.assertEqual(
+            (self.repository / "later-shebang.py").read_bytes(),
+            b"# MARKER-COMMENT: BEGIN\n"
+            b"# Managed\n"
+            b"# MARKER-COMMENT: END\n"
+            + fixtures["later-shebang.py"],
+        )
+        self.assertEqual(
+            (self.repository / "bin/tool.ts").read_bytes(),
+            b"#!/usr/bin/env node\r\n"
+            b"// MARKER-COMMENT: BEGIN\r\n"
+            b"// Managed\r\n"
+            b"// MARKER-COMMENT: END\r\n"
+            b"console.log('tool');\r\n",
+        )
+        self.assertEqual(
+            stat.S_IMODE((self.repository / "bin/tool.ts").stat().st_mode),
+            executable_mode,
+        )
+
+    def test_unterminated_leading_shebang_remains_a_separate_first_line(self) -> None:
+        self.add_bytes_at_head("bin/tool.sh", b"#!/bin/sh", executable=True)
+
+        result = self.run_processor("--marker-text", "Managed")
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(
+            (self.repository / "bin/tool.sh").read_bytes(),
+            b"#!/bin/sh\n"
+            b"# MARKER-COMMENT: BEGIN\n"
+            b"# Managed\n"
+            b"# MARKER-COMMENT: END",
+        )
+        self.assertTrue((self.repository / "bin/tool.sh").stat().st_mode & stat.S_IXUSR)
+
+        expected = (self.repository / "bin/tool.sh").read_bytes()
+        (self.repository / "marker-comment.patch").unlink()
+        self.git("add", "bin/tool.sh")
+        self.git("commit", "--quiet", "-m", "apply marker block")
+
+        second_result = self.run_processor("--marker-text", "Managed")
+
+        self.assertEqual(second_result.returncode, 0, second_result.stdout)
+        self.assertIn("eligible=1 changed=0", second_result.stdout)
+        self.assertEqual((self.repository / "bin/tool.sh").read_bytes(), expected)
+        self.assertFalse((self.repository / "marker-comment.patch").exists())
+
+    def test_every_supported_line_comment_mapping_has_canonical_golden_output(
+        self,
+    ) -> None:
+        cases = [
+            *[
+                (f"hash/file{extension}", "#")
+                for extension in [
+                    ".sh",
+                    ".bash",
+                    ".zsh",
+                    ".ksh",
+                    ".fish",
+                    ".py",
+                    ".rb",
+                    ".yml",
+                    ".yaml",
+                    ".toml",
+                    ".mk",
+                ]
+            ],
+            ("build/Dockerfile", "#"),
+            ("build/Dockerfile.release", "#"),
+            ("build/Makefile", "#"),
+            ("build/GNUmakefile", "#"),
+            *[
+                (f"slash/file{extension}", "//")
+                for extension in [
+                    ".js",
+                    ".jsx",
+                    ".mjs",
+                    ".cjs",
+                    ".ts",
+                    ".tsx",
+                    ".java",
+                    ".c",
+                    ".h",
+                    ".cc",
+                    ".cpp",
+                    ".cxx",
+                    ".hpp",
+                    ".cs",
+                    ".go",
+                    ".kt",
+                    ".kts",
+                    ".swift",
+                    ".rs",
+                ]
+            ],
+            *[
+                (f"bang/file{extension}", "!")
+                for extension in [".f90", ".f95", ".f03", ".f08", ".f18"]
+            ],
+        ]
+        for path, _prefix in cases:
+            destination = self.repository / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(f"original {path}\n", encoding="utf-8")
+        self.git("add", ".")
+        self.git("commit", "--quiet", "-m", "add all line-comment mappings")
+
+        result = self.run_processor("--marker-text", "Golden")
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(
+            f"Summary: discovered={len(cases)} eligible={len(cases)} "
+            f"changed={len(cases)} excluded=0 errored=0",
+            result.stdout,
+        )
+        for path, prefix in cases:
+            with self.subTest(path=path):
+                self.assertEqual(
+                    (self.repository / path).read_text(encoding="utf-8"),
+                    f"{prefix} MARKER-COMMENT: BEGIN\n"
+                    f"{prefix} Golden\n"
+                    f"{prefix} MARKER-COMMENT: END\n"
+                    f"original {path}\n",
+                )
+
+    def test_canonical_line_comment_file_is_not_rewritten(self) -> None:
+        content = (
+            b"// MARKER-COMMENT: BEGIN\n"
+            b"// Managed\n"
+            b"// MARKER-COMMENT: END\n"
+            b"const stable = true;\n"
+        )
+        self.add_bytes_at_head("stable.ts", content)
+        path = self.repository / "stable.ts"
+        os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+        modified_at = path.stat().st_mtime_ns
+
+        result = self.run_processor("--marker-text", "Managed")
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("eligible=1 changed=0", result.stdout)
+        self.assertEqual(path.read_bytes(), content)
+        self.assertEqual(path.stat().st_mtime_ns, modified_at)
+        self.assertFalse((self.repository / "marker-comment.patch").exists())
 
     def test_invalid_globs_are_rejected_before_processing_and_name_the_pattern(
         self,
