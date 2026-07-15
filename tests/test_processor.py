@@ -733,6 +733,358 @@ class ProcessorWorkflowTests(unittest.TestCase):
         self.assertEqual(path.stat().st_mtime_ns, modified_at)
         self.assertFalse((self.repository / "marker-comment.patch").exists())
 
+    def test_stale_and_misplaced_line_comment_blocks_are_reconciled(self) -> None:
+        fixtures = {
+            "stale.py": (
+                b"# MARKER-COMMENT: BEGIN\n"
+                b"  # Consumer-edited text\n"
+                b"# MARKER-COMMENT: END\n"
+                b"print('kept')\n"
+            ),
+            "misplaced.ts": (
+                b"const before = true;\r\n"
+                b"// MARKER-COMMENT: BEGIN\r\n"
+                b"// Old text\r\n"
+                b"// MARKER-COMMENT: END\r\n"
+                b"const after = true;\r\n"
+            ),
+        }
+        for path, content in fixtures.items():
+            self.add_bytes_at_head(path, content)
+
+        result = self.run_processor("--marker-text", "Canonical")
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(
+            (self.repository / "stale.py").read_bytes(),
+            b"# MARKER-COMMENT: BEGIN\n"
+            b"# Canonical\n"
+            b"# MARKER-COMMENT: END\n"
+            b"print('kept')\n",
+        )
+        self.assertEqual(
+            (self.repository / "misplaced.ts").read_bytes(),
+            b"// MARKER-COMMENT: BEGIN\r\n"
+            b"// Canonical\r\n"
+            b"// MARKER-COMMENT: END\r\n"
+            b"const before = true;\r\n"
+            b"const after = true;\r\n",
+        )
+        self.assertIn("changed=2", result.stdout)
+
+    def test_malformed_line_markers_leave_files_unchanged_and_keep_partial_patch(
+        self,
+    ) -> None:
+        fixtures = {
+            "a-lone-begin.py": b"# MARKER-COMMENT: BEGIN\nprint('kept')\n",
+            "b-lone-end.ts": b"// MARKER-COMMENT: END\nconst kept = true;\n",
+            "c-reversed.f90": (
+                b"! MARKER-COMMENT: END\n"
+                b"! MARKER-COMMENT: BEGIN\n"
+                b"program kept\n"
+            ),
+            "d-nested.py": (
+                b"# MARKER-COMMENT: BEGIN\n"
+                b"# MARKER-COMMENT: BEGIN\n"
+                b"# MARKER-COMMENT: END\n"
+                b"# MARKER-COMMENT: END\n"
+            ),
+            "e-duplicate.ts": (
+                b"// MARKER-COMMENT: BEGIN\n"
+                b"// first\n"
+                b"// MARKER-COMMENT: END\n"
+                b"// MARKER-COMMENT: BEGIN\n"
+                b"// second\n"
+                b"// MARKER-COMMENT: END\n"
+            ),
+            "f-invalid.sh": (
+                b"# MARKER-COMMENT: BEGIN\n"
+                b"echo 'must stay outside managed comments'\n"
+                b"# MARKER-COMMENT: END\n"
+            ),
+            "z-valid.py": b"print('valid')\n",
+        }
+        for path, content in fixtures.items():
+            self.add_bytes_at_head(path, content)
+
+        result = self.run_processor(
+            "--marker-text", "Canonical", "--report-only"
+        )
+
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn(
+            "Summary: discovered=7 eligible=7 changed=1 excluded=0 errored=6",
+            result.stdout,
+        )
+        for path in list(fixtures)[:-1]:
+            with self.subTest(path=path):
+                self.assertEqual((self.repository / path).read_bytes(), fixtures[path])
+                self.assertIn(f"- {path}:", result.stdout)
+        self.assertTrue(
+            (self.repository / "z-valid.py")
+            .read_bytes()
+            .startswith(b"# MARKER-COMMENT: BEGIN\n# Canonical\n")
+        )
+        patch = self.repository / "marker-comment.patch"
+        self.assertTrue(patch.exists())
+        self.git("restore", "z-valid.py")
+        self.git("apply", "--check", "marker-comment.patch")
+
+    def test_canonical_blocks_before_required_preambles_are_moved(self) -> None:
+        fixtures = {
+            "tool.sh": (
+                b"# MARKER-COMMENT: BEGIN\n"
+                b"# Canonical\n"
+                b"# MARKER-COMMENT: END\n"
+                b"#!/bin/sh\n"
+                b"echo kept\n"
+            ),
+            "document.xml": (
+                b"<!-- MARKER-COMMENT: BEGIN\n"
+                b"     Canonical\n"
+                b"     MARKER-COMMENT: END -->\n"
+                b'<?xml version="1.0"?>\n'
+                b"<root>kept</root>\n"
+            ),
+        }
+        for path, content in fixtures.items():
+            self.add_bytes_at_head(path, content)
+
+        result = self.run_processor("--marker-text", "Canonical")
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(
+            (self.repository / "tool.sh").read_bytes(),
+            b"#!/bin/sh\n"
+            b"# MARKER-COMMENT: BEGIN\n"
+            b"# Canonical\n"
+            b"# MARKER-COMMENT: END\n"
+            b"echo kept\n",
+        )
+        self.assertEqual(
+            (self.repository / "document.xml").read_bytes(),
+            b'<?xml version="1.0"?>\n'
+            b"<!-- MARKER-COMMENT: BEGIN\n"
+            b"     Canonical\n"
+            b"     MARKER-COMMENT: END -->\n"
+            b"<root>kept</root>\n",
+        )
+
+    def test_stale_and_misplaced_block_comments_are_reconciled(self) -> None:
+        fixtures = {
+            "stale.html": (
+                b"<!-- MARKER-COMMENT: BEGIN\n"
+                b"     Consumer-edited text\n"
+                b"     MARKER-COMMENT: END -->\n"
+                b"<main>kept</main>\n"
+            ),
+            "misplaced.css": (
+                b"before { display: block; }\r\n"
+                b"/* MARKER-COMMENT: BEGIN\r\n"
+                b" * Old text\r\n"
+                b" * MARKER-COMMENT: END */\r\n"
+                b"after { display: block; }\r\n"
+            ),
+        }
+        for path, content in fixtures.items():
+            self.add_bytes_at_head(path, content)
+
+        result = self.run_processor("--marker-text", "Canonical")
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(
+            (self.repository / "stale.html").read_bytes(),
+            b"<!-- MARKER-COMMENT: BEGIN\n"
+            b"     Canonical\n"
+            b"     MARKER-COMMENT: END -->\n"
+            b"<main>kept</main>\n",
+        )
+        self.assertEqual(
+            (self.repository / "misplaced.css").read_bytes(),
+            b"/* MARKER-COMMENT: BEGIN\r\n"
+            b" * Canonical\r\n"
+            b" * MARKER-COMMENT: END */\r\n"
+            b"before { display: block; }\r\n"
+            b"after { display: block; }\r\n",
+        )
+
+    def test_malformed_block_markers_leave_every_affected_file_unchanged(
+        self,
+    ) -> None:
+        fixtures = {
+            "a-lone-begin.html": (
+                b"<!-- MARKER-COMMENT: BEGIN\n<main>kept</main>\n"
+            ),
+            "b-lone-end.css": (
+                b" * MARKER-COMMENT: END */\nbody { color: black; }\n"
+            ),
+            "c-reversed.html": (
+                b"     MARKER-COMMENT: END -->\n"
+                b"<!-- MARKER-COMMENT: BEGIN\n"
+            ),
+            "d-nested.css": (
+                b"/* MARKER-COMMENT: BEGIN\n"
+                b"/* MARKER-COMMENT: BEGIN\n"
+                b" * MARKER-COMMENT: END */\n"
+                b" * MARKER-COMMENT: END */\n"
+            ),
+            "e-duplicate.html": (
+                b"<!-- MARKER-COMMENT: BEGIN\n"
+                b"     first\n"
+                b"     MARKER-COMMENT: END -->\n"
+                b"<!-- MARKER-COMMENT: BEGIN\n"
+                b"     second\n"
+                b"     MARKER-COMMENT: END -->\n"
+            ),
+            "f-invalid.html": (
+                b"<!-- MARKER-COMMENT: BEGIN\n"
+                b"     closes -- too early -->\n"
+                b"     MARKER-COMMENT: END -->\n"
+            ),
+            "g-invalid.css": (
+                b"/* MARKER-COMMENT: BEGIN\n"
+                b" * closes */ too early\n"
+                b" * MARKER-COMMENT: END */\n"
+            ),
+        }
+        for path, content in fixtures.items():
+            self.add_bytes_at_head(path, content)
+
+        result = self.run_processor("--marker-text", "Canonical")
+
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn(
+            "Summary: discovered=7 eligible=7 changed=0 excluded=0 errored=7",
+            result.stdout,
+        )
+        for path, content in fixtures.items():
+            with self.subTest(path=path):
+                self.assertEqual((self.repository / path).read_bytes(), content)
+                self.assertIn(f"- {path}:", result.stdout)
+        self.assertFalse((self.repository / "marker-comment.patch").exists())
+
+    def test_sentinels_in_separate_block_comments_are_structurally_invalid(
+        self,
+    ) -> None:
+        fixtures = {
+            "separate.html": (
+                b"<!-- MARKER-COMMENT: BEGIN -->\n"
+                b"<main>must not be claimed</main>\n"
+                b"<!-- MARKER-COMMENT: END -->\n"
+            ),
+            "separate.css": (
+                b"/* MARKER-COMMENT: BEGIN */\n"
+                b"body { color: black; }\n"
+                b"/* MARKER-COMMENT: END */\n"
+            ),
+        }
+        for path, content in fixtures.items():
+            self.add_bytes_at_head(path, content)
+
+        result = self.run_processor("--marker-text", "Canonical")
+
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("changed=0 excluded=0 errored=2", result.stdout)
+        for path, content in fixtures.items():
+            self.assertEqual((self.repository / path).read_bytes(), content)
+            self.assertIn(f"- {path}: Marker Comment Block has invalid", result.stdout)
+        self.assertFalse((self.repository / "marker-comment.patch").exists())
+
+    def test_old_sentinel_labels_are_ordinary_content(self) -> None:
+        fixtures = {
+            "legacy.py": (
+                b"# OLD-MARKER: BEGIN\n"
+                b"# Legacy body\n"
+                b"# OLD-MARKER: END\n"
+                b"print('kept')\n"
+            ),
+            "legacy.html": (
+                b"<!-- OLD-MARKER: BEGIN\n"
+                b"     Legacy body\n"
+                b"     OLD-MARKER: END -->\n"
+                b"<main>kept</main>\n"
+            ),
+        }
+        for path, content in fixtures.items():
+            self.add_bytes_at_head(path, content)
+
+        result = self.run_processor(
+            "--marker-text",
+            "Canonical",
+            "--begin-sentinel",
+            "NEW-MARKER: BEGIN",
+            "--end-sentinel",
+            "NEW-MARKER: END",
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(
+            (self.repository / "legacy.py").read_bytes(),
+            b"# NEW-MARKER: BEGIN\n"
+            b"# Canonical\n"
+            b"# NEW-MARKER: END\n"
+            + fixtures["legacy.py"],
+        )
+        self.assertEqual(
+            (self.repository / "legacy.html").read_bytes(),
+            b"<!-- NEW-MARKER: BEGIN\n"
+            b"     Canonical\n"
+            b"     NEW-MARKER: END -->\n"
+            + fixtures["legacy.html"],
+        )
+
+    def test_managed_body_cannot_create_ambiguous_line_sentinels(self) -> None:
+        fixtures = {
+            "ambiguous.py": b"print('must stay')\n",
+            "valid.html": b"<main>kept</main>\n",
+        }
+        for path, content in fixtures.items():
+            self.add_bytes_at_head(path, content)
+
+        result = self.run_processor(
+            "--marker-text", "MARKER-COMMENT: BEGIN", "--report-only"
+        )
+
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("changed=1 excluded=0 errored=1", result.stdout)
+        self.assertIn(
+            "- ambiguous.py: Managed Marker Body conflicts with the configured sentinels",
+            result.stdout,
+        )
+        self.assertEqual(
+            (self.repository / "ambiguous.py").read_bytes(), fixtures["ambiguous.py"]
+        )
+        self.assertTrue(
+            (self.repository / "valid.html")
+            .read_bytes()
+            .startswith(b"<!-- MARKER-COMMENT: BEGIN\n")
+        )
+        self.assertTrue((self.repository / "marker-comment.patch").exists())
+
+    def test_reconciled_blocks_are_idempotent_on_the_next_run(self) -> None:
+        self.add_bytes_at_head(
+            "document.xml",
+            b'<?xml version="1.0"?>\n'
+            b"<root>before</root>\n"
+            b"<!-- MARKER-COMMENT: BEGIN\n"
+            b"     stale\n"
+            b"     MARKER-COMMENT: END -->\n",
+        )
+
+        first = self.run_processor("--marker-text", "Canonical")
+        self.assertEqual(first.returncode, 1, first.stdout)
+        reconciled = (self.repository / "document.xml").read_bytes()
+        (self.repository / "marker-comment.patch").unlink()
+        self.git("add", "document.xml")
+        self.git("commit", "--quiet", "-m", "apply reconciliation")
+
+        second = self.run_processor("--marker-text", "Canonical")
+
+        self.assertEqual(second.returncode, 0, second.stdout)
+        self.assertIn("eligible=1 changed=0", second.stdout)
+        self.assertEqual((self.repository / "document.xml").read_bytes(), reconciled)
+        self.assertFalse((self.repository / "marker-comment.patch").exists())
+
     def test_every_supported_block_comment_mapping_has_canonical_golden_output(
         self,
     ) -> None:

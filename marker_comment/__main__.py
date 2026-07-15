@@ -178,9 +178,33 @@ class ConfiguredSentinels:
 
 
 @dataclass(frozen=True)
-class SyntaxSafetyError:
+class FileProcessingError:
     path: Path
     message: str
+
+
+@dataclass(frozen=True)
+class ExistingMarkerBlock:
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
+class LineSpan:
+    start: int
+    end: int
+    content: bytes
+
+
+@dataclass(frozen=True)
+class MarkerSentinelPattern:
+    begin_line: bytes
+    end_line: bytes
+    body_prefix: bytes
+    blank_body_line: bytes
+    begin_candidates: frozenset[bytes]
+    end_candidates: frozenset[bytes]
+    forbidden_body_token: bytes | None = None
 
 
 def git(repository: Path, *arguments: str) -> bytes:
@@ -223,24 +247,14 @@ def render_block(
     sentinels: ConfiguredSentinels,
 ) -> bytes:
     lines = normalized_marker_lines(marker_text)
-    if syntax is CommentSyntax.HTML_BLOCK:
-        rendered = [f"<!-- {sentinels.begin}"]
-        rendered.extend(f"     {line}" if line else "    " for line in lines)
-        rendered.append(f"     {sentinels.end} -->")
-        return newline.join(line.encode() for line in rendered) + newline
-    if syntax is CommentSyntax.CSS_BLOCK:
-        rendered = [f"/* {sentinels.begin}"]
-        rendered.extend(f" * {line}" if line else " *" for line in lines)
-        rendered.append(f" * {sentinels.end} */")
-        return newline.join(line.encode() for line in rendered) + newline
-
-    prefix = LINE_COMMENT_PREFIXES[syntax]
-    rendered = [f"{prefix} {sentinels.begin}"]
+    pattern = marker_sentinel_pattern(syntax, sentinels)
+    rendered = [pattern.begin_line]
     rendered.extend(
-        f"{prefix} {line}" if line else prefix for line in lines
+        pattern.body_prefix + line.encode() if line else pattern.blank_body_line
+        for line in lines
     )
-    rendered.append(f"{prefix} {sentinels.end}")
-    return newline.join(line.encode() for line in rendered) + newline
+    rendered.append(pattern.end_line)
+    return newline.join(rendered) + newline
 
 
 def syntax_safety_error(
@@ -276,6 +290,155 @@ def insertion_position(content: bytes) -> int:
             return position + 1
         return position
     return 0
+
+
+def line_spans(content: bytes) -> list[LineSpan]:
+    spans: list[LineSpan] = []
+    start = 0
+    while start < len(content):
+        line_feed = content.find(b"\n", start)
+        end = len(content) if line_feed == -1 else line_feed + 1
+        logical_end = end
+        if logical_end > start and content[logical_end - 1 : logical_end] == b"\n":
+            logical_end -= 1
+            if (
+                logical_end > start
+                and content[logical_end - 1 : logical_end] == b"\r"
+            ):
+                logical_end -= 1
+        spans.append(LineSpan(start, end, content[start:logical_end]))
+        start = end
+    return spans
+
+
+def marker_sentinel_pattern(
+    syntax: CommentSyntax, sentinels: ConfiguredSentinels
+) -> MarkerSentinelPattern:
+    if syntax is CommentSyntax.HTML_BLOCK:
+        begin_line = f"<!-- {sentinels.begin}".encode()
+        end_line = f"     {sentinels.end} -->".encode()
+        return MarkerSentinelPattern(
+            begin_line,
+            end_line,
+            b"     ",
+            b"    ",
+            frozenset({begin_line, f"<!-- {sentinels.begin} -->".encode()}),
+            frozenset({end_line, f"<!-- {sentinels.end} -->".encode()}),
+            b"--",
+        )
+    if syntax is CommentSyntax.CSS_BLOCK:
+        begin_line = f"/* {sentinels.begin}".encode()
+        end_line = f" * {sentinels.end} */".encode()
+        return MarkerSentinelPattern(
+            begin_line,
+            end_line,
+            b" * ",
+            b" *",
+            frozenset({begin_line, f"/* {sentinels.begin} */".encode()}),
+            frozenset({end_line, f"/* {sentinels.end} */".encode()}),
+            b"*/",
+        )
+    prefix = LINE_COMMENT_PREFIXES[syntax].encode() + b" "
+    begin_line = prefix + sentinels.begin.encode()
+    end_line = prefix + sentinels.end.encode()
+    return MarkerSentinelPattern(
+        begin_line,
+        end_line,
+        prefix,
+        prefix[:-1],
+        frozenset({begin_line}),
+        frozenset({end_line}),
+    )
+
+
+def inspect_marker_block(
+    content: bytes,
+    syntax: CommentSyntax,
+    sentinels: ConfiguredSentinels,
+) -> tuple[ExistingMarkerBlock | None, str | None]:
+    pattern = marker_sentinel_pattern(syntax, sentinels)
+    spans = line_spans(content)
+    begins = [span for span in spans if span.content in pattern.begin_candidates]
+    ends = [span for span in spans if span.content in pattern.end_candidates]
+
+    if not begins and not ends:
+        return None, None
+    if not begins:
+        return None, "end sentinel appears without a begin sentinel"
+    if not ends:
+        return None, "begin sentinel appears without an end sentinel"
+    if begins[0].start > ends[0].start:
+        return None, "end sentinel appears before the begin sentinel"
+    if len(begins) > 1 or len(ends) > 1:
+        if len(begins) > 1 and begins[1].start < ends[0].start:
+            return None, "marker sentinels are nested"
+        return None, "more than one Marker Comment Block is present"
+    if (
+        begins[0].content != pattern.begin_line
+        or ends[0].content != pattern.end_line
+    ):
+        return None, "Marker Comment Block has invalid comment structure"
+    body_spans = [
+        span
+        for span in spans
+        if span.start >= begins[0].end and span.end <= ends[0].start
+    ]
+    line_prefix = LINE_COMMENT_PREFIXES.get(syntax)
+    if line_prefix is not None and any(
+        not span.content.lstrip(b" \t").startswith(line_prefix.encode())
+        for span in body_spans
+    ):
+        return None, "Marker Comment Block has invalid line-comment structure"
+    if (
+        pattern.forbidden_body_token is not None
+        and pattern.forbidden_body_token
+        in content[begins[0].end : ends[0].start]
+    ):
+        return None, "Marker Comment Block has invalid comment structure"
+    return ExistingMarkerBlock(begins[0].start, ends[0].end), None
+
+
+def place_block(content: bytes, block: bytes, newline: bytes) -> bytes:
+    position = insertion_position(content)
+    preamble_separator = (
+        newline
+        if position > 0 and position == len(content) and b"\n" not in content
+        else b""
+    )
+    placed_block = preamble_separator + (
+        block[: -len(newline)] if preamble_separator else block
+    )
+    return content[:position] + placed_block + content[position:]
+
+
+def reconcile_marker_block(
+    content: bytes,
+    block: bytes,
+    newline: bytes,
+    syntax: CommentSyntax,
+    sentinels: ConfiguredSentinels,
+) -> tuple[bytes | None, str | None]:
+    existing, error = inspect_marker_block(content, syntax, sentinels)
+    if error is not None:
+        return None, error
+    _, rendered_error = inspect_marker_block(block, syntax, sentinels)
+    if rendered_error is not None:
+        return None, "Managed Marker Body conflicts with the configured sentinels"
+    without_existing = (
+        content
+        if existing is None
+        else content[: existing.start] + content[existing.end :]
+    )
+    candidate = place_block(without_existing, block, newline)
+    if (
+        existing is not None
+        and content[existing.start : existing.end] == block[: -len(newline)]
+        and candidate == content + newline
+    ):
+        return content, None
+    return candidate, None
+
+
 def write_atomically(path: Path, content: bytes) -> None:
     with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as temporary_file:
         temporary_file.write(content)
@@ -582,7 +745,7 @@ def main() -> int:
         print(f"Error: {error}")
         return 2
     changed: list[Path] = []
-    errors: list[SyntaxSafetyError] = []
+    errors: list[FileProcessingError] = []
 
     for eligible_file in eligible:
         relative_path = eligible_file.path
@@ -594,7 +757,7 @@ def main() -> int:
             sentinels,
         )
         if safety_error is not None:
-            errors.append(SyntaxSafetyError(relative_path, safety_error))
+            errors.append(FileProcessingError(relative_path, safety_error))
             continue
         newline = b"\r\n" if b"\r\n" in original else b"\n"
         block = render_block(
@@ -603,28 +766,17 @@ def main() -> int:
             eligible_file.syntax,
             sentinels,
         )
-        position = insertion_position(original)
-        preamble_separator = (
-            newline
-            if (
-                position > 0
-                and position == len(original)
-                and b"\n" not in original
-            )
-            else b""
+        candidate, marker_error = reconcile_marker_block(
+            original,
+            block,
+            newline,
+            eligible_file.syntax,
+            sentinels,
         )
-        placed_block = preamble_separator + (
-            block[: -len(newline)] if preamble_separator else block
-        )
-        content_at_position = original[position:]
-        block_is_canonical = content_at_position.startswith(placed_block) or (
-            not preamble_separator and content_at_position == block[: -len(newline)]
-        )
-        candidate = (
-            original
-            if block_is_canonical
-            else original[:position] + placed_block + original[position:]
-        )
+        if marker_error is not None:
+            errors.append(FileProcessingError(relative_path, marker_error))
+            continue
+        assert candidate is not None
         if candidate != original:
             path.write_bytes(candidate)
             changed.append(relative_path)
