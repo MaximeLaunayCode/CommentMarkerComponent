@@ -1,0 +1,57 @@
+spec:
+  component: [version]
+  inputs:
+    marker-text:
+      type: string
+      description: Text rendered as the Managed Marker Body.
+    job-name:
+      type: string
+      default: marker-comment
+      description: Name of the job added to the consuming pipeline.
+    stage:
+      type: string
+      default: test
+      description: Existing consumer stage in which the job runs.
+    fail-when-patch-needed:
+      type: boolean
+      default: true
+      description: Fail with exit 1 when a Marker Comment Block patch is needed.
+    file-globs:
+      type: array
+      default: []
+      description: Optional Git-wildmatch patterns narrowing supported files.
+    exclude-globs:
+      type: array
+      default: []
+      description: Optional Git-wildmatch patterns added to built-in exclusions.
+    begin-sentinel:
+      type: string
+      default: "MARKER-COMMENT: BEGIN"
+      description: Exact begin label identifying the managed block.
+    end-sentinel:
+      type: string
+      default: "MARKER-COMMENT: END"
+      description: Exact end label identifying the managed block.
+---
+"$[[ inputs.job-name ]]":
+  stage: $[[ inputs.stage ]]
+  image: registry.gitlab.com/platform/ci-components/marker-comment:$[[ component.version ]]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  variables:
+    GIT_DEPTH: "0"
+  script:
+    - >-
+      marker-comment-process
+      --marker-text $[[ inputs.marker-text | posix_escape ]]
+      --fail-when-patch-needed $[[ inputs.fail-when-patch-needed ]]
+      --file-globs "$[[ inputs.file-globs ]]"
+      --exclude-globs "$[[ inputs.exclude-globs ]]"
+      --begin-sentinel $[[ inputs.begin-sentinel | posix_escape ]]
+      --end-sentinel $[[ inputs.end-sentinel | posix_escape ]]
+  artifacts:
+    when: always
+    name: marker-comment-$CI_COMMIT_SHORT_SHA
+    paths:
+      - marker-comment.patch
+    expire_in: 1 week

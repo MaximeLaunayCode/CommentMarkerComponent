@@ -1502,6 +1502,39 @@ class ProcessorWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(self.git("status", "--short").stdout, status_after_apply)
 
+    def test_component_command_accepts_serialized_globs_and_boolean_enforcement(
+        self,
+    ) -> None:
+        self.add_file_at_head("source.py", "source\n")
+        self.add_file_at_head("ignored.js", "ignored\n")
+
+        result = self.run_processor(
+            "--marker-text",
+            "Managed by platform",
+            "--fail-when-patch-needed",
+            "false",
+            "--file-globs",
+            '["*.py", "*.js"]',
+            "--exclude-globs",
+            '["ignored.*"]',
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(
+            "Summary: discovered=2 eligible=1 changed=1 excluded=1",
+            result.stdout,
+        )
+        self.assertTrue(
+            (self.repository / "source.py")
+            .read_text(encoding="utf-8")
+            .startswith("# MARKER-COMMENT: BEGIN\n")
+        )
+        self.assertEqual(
+            (self.repository / "ignored.js").read_text(encoding="utf-8"),
+            "ignored\n",
+        )
+        self.assertTrue((self.repository / "marker-comment.patch").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from enum import Enum
+import json
 import os
 from pathlib import Path
 import re
@@ -464,11 +465,38 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate Marker Comment Block changes")
     parser.add_argument("--marker-text", required=True)
     parser.add_argument("--report-only", action="store_true")
+    parser.add_argument(
+        "--fail-when-patch-needed",
+        type=parse_boolean,
+        help="Internal component adapter for the boolean public input.",
+    )
     parser.add_argument("--file-glob", action="append", default=[])
     parser.add_argument("--exclude-glob", action="append", default=[])
+    parser.add_argument("--file-globs", type=parse_serialized_globs, default=[])
+    parser.add_argument("--exclude-globs", type=parse_serialized_globs, default=[])
     parser.add_argument("--begin-sentinel", default="MARKER-COMMENT: BEGIN")
     parser.add_argument("--end-sentinel", default="MARKER-COMMENT: END")
     return parser.parse_args()
+
+
+def parse_boolean(value: str) -> bool:
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise argparse.ArgumentTypeError("expected 'true' or 'false'")
+
+
+def parse_serialized_globs(value: str) -> list[str]:
+    try:
+        globs = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise argparse.ArgumentTypeError(
+            "expected a JSON array of glob strings"
+        ) from error
+    if not isinstance(globs, list) or any(not isinstance(glob, str) for glob in globs):
+        raise argparse.ArgumentTypeError("expected a JSON array of glob strings")
+    return globs
 
 
 def validate_glob(pattern: str) -> None:
@@ -703,8 +731,14 @@ def main() -> int:
             arguments.begin_sentinel, arguments.end_sentinel
         )
         sentinels.validate()
-        file_globs = [compile_glob(pattern) for pattern in arguments.file_glob]
-        exclude_globs = [compile_glob(pattern) for pattern in arguments.exclude_glob]
+        file_globs = [
+            compile_glob(pattern)
+            for pattern in [*arguments.file_glob, *arguments.file_globs]
+        ]
+        exclude_globs = [
+            compile_glob(pattern)
+            for pattern in [*arguments.exclude_glob, *arguments.exclude_globs]
+        ]
         configuration = load_configuration(arguments.marker_text)
         discovered = discover_added_files(configuration)
     except ProcessorError as error:
@@ -825,7 +859,10 @@ def main() -> int:
         print("Commit the applied changes and push them to the merge request source branch.")
         if errors:
             return 2
-        return 0 if arguments.report_only else 1
+        report_only = (
+            arguments.report_only or arguments.fail_when_patch_needed is False
+        )
+        return 0 if report_only else 1
 
     if errors:
         return 2
