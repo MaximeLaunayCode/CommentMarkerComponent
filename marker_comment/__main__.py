@@ -142,6 +142,12 @@ class ProcessorError(Exception):
 
 
 @dataclass(frozen=True)
+class FileError:
+    path: Path
+    message: str
+
+
+@dataclass(frozen=True)
 class MergeRequestConfiguration:
     repository: Path
     diff_base_sha: str
@@ -178,22 +184,80 @@ def comment_syntax_for(path: Path) -> CommentSyntax | None:
     return None
 
 
-def render_block(marker_text: str, newline: bytes, syntax: CommentSyntax) -> bytes:
+def normalized_marker_lines(marker_text: str) -> list[str]:
+    return [line.rstrip() for line in marker_text.splitlines()]
+
+
+def render_block(
+    marker_text: str,
+    newline: bytes,
+    syntax: CommentSyntax,
+    begin_sentinel: str,
+    end_sentinel: str,
+) -> bytes:
+    lines = normalized_marker_lines(marker_text)
+    if syntax is CommentSyntax.HTML_BLOCK:
+        rendered = [f"<!-- {begin_sentinel}"]
+        rendered.extend(f"     {line}" if line else "    " for line in lines)
+        rendered.append(f"     {end_sentinel} -->")
+        return newline.join(line.encode() for line in rendered) + newline
+    if syntax is CommentSyntax.CSS_BLOCK:
+        rendered = [f"/* {begin_sentinel}"]
+        rendered.extend(f" * {line}" if line else " *" for line in lines)
+        rendered.append(f" * {end_sentinel} */")
+        return newline.join(line.encode() for line in rendered) + newline
+
     prefix = LINE_COMMENT_PREFIXES[syntax]
-    lines = marker_text.splitlines()
-    rendered = [f"{prefix} MARKER-COMMENT: BEGIN"]
+    rendered = [f"{prefix} {begin_sentinel}"]
     rendered.extend(
-        f"{prefix} {line.rstrip()}" if line.rstrip() else prefix for line in lines
+        f"{prefix} {line}" if line else prefix for line in lines
     )
-    rendered.append(f"{prefix} MARKER-COMMENT: END")
+    rendered.append(f"{prefix} {end_sentinel}")
     return newline.join(line.encode() for line in rendered) + newline
 
 
+def syntax_safety_error(
+    marker_text: str,
+    syntax: CommentSyntax,
+    begin_sentinel: str,
+    end_sentinel: str,
+) -> str | None:
+    forbidden = {
+        CommentSyntax.HTML_BLOCK: "--",
+        CommentSyntax.CSS_BLOCK: "*/",
+    }.get(syntax)
+    if forbidden is None:
+        return None
+    if any(
+        forbidden in configured
+        for configured in (begin_sentinel, end_sentinel, marker_text)
+    ):
+        return f"comment syntax does not allow {forbidden!r}"
+    return None
+
+
 def insertion_position(content: bytes) -> int:
-    if not content.startswith(b"#!"):
-        return 0
-    line_end = content.find(b"\n")
-    return len(content) if line_end == -1 else line_end + 1
+    if content.startswith(b"#!"):
+        line_end = content.find(b"\n")
+        return len(content) if line_end == -1 else line_end + 1
+
+    if content.startswith(b"<?xml") and len(content) > 5 and content[5:6].isspace():
+        declaration_end = content.find(b"?>", 6)
+        first_line_end = content.find(b"\n")
+        if declaration_end != -1 and (
+            first_line_end == -1 or declaration_end < first_line_end
+        ):
+            position = declaration_end + 2
+            if content[position : position + 2] == b"\r\n":
+                return position + 2
+            if content[position : position + 1] in {b"\r", b"\n"}:
+                return position + 1
+            return position
+    return 0
+
+
+def has_leading_preamble(content: bytes) -> bool:
+    return content.startswith(b"#!") or insertion_position(content) > 0
 
 
 def write_atomically(path: Path, content: bytes) -> None:
@@ -223,7 +287,26 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--report-only", action="store_true")
     parser.add_argument("--file-glob", action="append", default=[])
     parser.add_argument("--exclude-glob", action="append", default=[])
+    parser.add_argument("--begin-sentinel", default="MARKER-COMMENT: BEGIN")
+    parser.add_argument("--end-sentinel", default="MARKER-COMMENT: END")
     return parser.parse_args()
+
+
+def validate_sentinels(begin_sentinel: str, end_sentinel: str) -> None:
+    for name, sentinel in (
+        ("begin sentinel", begin_sentinel),
+        ("end sentinel", end_sentinel),
+    ):
+        if not sentinel:
+            raise ProcessorError(f"{name} must not be empty")
+        if sentinel != sentinel.strip():
+            raise ProcessorError(f"{name} must not have leading or trailing whitespace")
+        if "\0" in sentinel:
+            raise ProcessorError(f"{name} must not contain a NUL byte")
+        if sentinel.splitlines() != [sentinel]:
+            raise ProcessorError(f"{name} must be a single line")
+    if begin_sentinel == end_sentinel:
+        raise ProcessorError("begin and end sentinels must be distinct")
 
 
 def validate_glob(pattern: str) -> None:
@@ -454,6 +537,7 @@ def discover_added_files(configuration: MergeRequestConfiguration) -> list[Path]
 def main() -> int:
     arguments = parse_arguments()
     try:
+        validate_sentinels(arguments.begin_sentinel, arguments.end_sentinel)
         file_globs = [compile_glob(pattern) for pattern in arguments.file_glob]
         exclude_globs = [compile_glob(pattern) for pattern in arguments.exclude_glob]
         configuration = load_configuration(arguments.marker_text)
@@ -496,31 +580,45 @@ def main() -> int:
         print(f"Error: {error}")
         return 2
     changed: list[Path] = []
+    errors: list[FileError] = []
 
     for eligible_file in eligible:
-        if eligible_file.syntax not in LINE_COMMENT_PREFIXES:
-            continue
         relative_path = eligible_file.path
         path = repository / relative_path
         original = path.read_bytes()
+        safety_error = syntax_safety_error(
+            arguments.marker_text,
+            eligible_file.syntax,
+            arguments.begin_sentinel,
+            arguments.end_sentinel,
+        )
+        if safety_error is not None:
+            errors.append(FileError(relative_path, safety_error))
+            continue
         newline = b"\r\n" if b"\r\n" in original else b"\n"
-        block = render_block(arguments.marker_text, newline, eligible_file.syntax)
+        block = render_block(
+            arguments.marker_text,
+            newline,
+            eligible_file.syntax,
+            arguments.begin_sentinel,
+            arguments.end_sentinel,
+        )
         position = insertion_position(original)
-        shebang_separator = (
+        preamble_separator = (
             newline
             if (
-                original.startswith(b"#!")
+                has_leading_preamble(original)
                 and position == len(original)
                 and b"\n" not in original
             )
             else b""
         )
-        placed_block = shebang_separator + (
-            block[: -len(newline)] if shebang_separator else block
+        placed_block = preamble_separator + (
+            block[: -len(newline)] if preamble_separator else block
         )
         content_at_position = original[position:]
         block_is_canonical = content_at_position.startswith(placed_block) or (
-            not shebang_separator and content_at_position == block[: -len(newline)]
+            not preamble_separator and content_at_position == block[: -len(newline)]
         )
         candidate = (
             original
@@ -551,7 +649,7 @@ def main() -> int:
     print(
         "Summary: "
         f"discovered={len(discovered)} eligible={len(eligible)} "
-        f"changed={len(changed)} excluded={len(excluded)} errored=0"
+        f"changed={len(changed)} excluded={len(excluded)} errored={len(errors)}"
     )
     if changed:
         print("Changed Files")
@@ -563,13 +661,22 @@ def main() -> int:
             print(
                 f"- {format_path(excluded_file.path)}: {excluded_file.description()}"
             )
+    if errors:
+        print("Errors")
+        for error in errors:
+            print(f"- {format_path(error.path)}: {error.message}")
     if changed:
         artifact_sha = os.environ.get("CI_COMMIT_SHORT_SHA", "unknown")
         print(f"Patch artifact: marker-comment-{artifact_sha} (retained for one week)")
         print("git apply --check marker-comment.patch")
         print("git apply marker-comment.patch")
         print("Commit the applied changes and push them to the merge request source branch.")
+        if errors:
+            return 2
         return 0 if arguments.report_only else 1
+
+    if errors:
+        return 2
 
     if not eligible:
         print("No Eligible MR-Added Files found.")

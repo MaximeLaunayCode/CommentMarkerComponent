@@ -477,7 +477,7 @@ class ProcessorWorkflowTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn(
-            "Summary: discovered=5 eligible=5 changed=3 excluded=0 errored=0",
+            "Summary: discovered=5 eligible=5 changed=5 excluded=0 errored=0",
             result.stdout,
         )
         self.assertNotIn("Excluded MR-Added Files", result.stdout)
@@ -491,11 +491,16 @@ class ProcessorWorkflowTests(unittest.TestCase):
                     prefix + b" MARKER-COMMENT: BEGIN\n"
                 )
             )
-        for path in paths[3:]:
-            self.assertEqual(
-                (self.repository / path).read_text(encoding="utf-8"),
-                f"original {path}\n",
-            )
+        self.assertTrue(
+            (self.repository / "page.html")
+            .read_bytes()
+            .startswith(b"<!-- MARKER-COMMENT: BEGIN\n")
+        )
+        self.assertTrue(
+            (self.repository / "style.css")
+            .read_bytes()
+            .startswith(b"/* MARKER-COMMENT: BEGIN\n")
+        )
 
     def test_line_comment_families_render_their_assigned_prefixes(self) -> None:
         cases = {
@@ -727,6 +732,168 @@ class ProcessorWorkflowTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), content)
         self.assertEqual(path.stat().st_mtime_ns, modified_at)
         self.assertFalse((self.repository / "marker-comment.patch").exists())
+
+    def test_every_supported_block_comment_mapping_has_canonical_golden_output(
+        self,
+    ) -> None:
+        cases = {
+            **{
+                f"html/file{extension}": (
+                    "<!-- MARKER-COMMENT: BEGIN\n"
+                    "     Golden\n"
+                    "     MARKER-COMMENT: END -->\n"
+                )
+                for extension in [
+                    ".html",
+                    ".htm",
+                    ".xml",
+                    ".md",
+                    ".markdown",
+                    ".vue",
+                    ".svelte",
+                ]
+            },
+            **{
+                f"css/file{extension}": (
+                    "/* MARKER-COMMENT: BEGIN\n"
+                    " * Golden\n"
+                    " * MARKER-COMMENT: END */\n"
+                )
+                for extension in [".css", ".scss", ".sass", ".less"]
+            },
+        }
+        for path in cases:
+            destination = self.repository / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(f"original {path}\n", encoding="utf-8")
+        self.git("add", ".")
+        self.git("commit", "--quiet", "-m", "add all block-comment mappings")
+
+        result = self.run_processor("--marker-text", "Golden")
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(
+            f"Summary: discovered={len(cases)} eligible={len(cases)} "
+            f"changed={len(cases)} excluded=0 errored=0",
+            result.stdout,
+        )
+        for path, block in cases.items():
+            with self.subTest(path=path):
+                self.assertEqual(
+                    (self.repository / path).read_text(encoding="utf-8"),
+                    block + f"original {path}\n",
+                )
+
+    def test_block_rendering_preserves_xml_placement_newlines_and_surrounding_bytes(
+        self,
+    ) -> None:
+        fixtures = {
+            "document.xml": b'<?xml version="1.0"?>\r\n<root>kept</root>\r\n',
+            "later.xml": b"<root/>\n<?xml declaration-like?>\n",
+            "empty.css": b"",
+            "no-terminal.html": b"<main>kept</main>",
+        }
+        for path, content in fixtures.items():
+            self.add_bytes_at_head(path, content)
+
+        result = self.run_processor(
+            "--marker-text", "  first  \r\n\r\n\tsecond\t \rthird\n"
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        html_lf = (
+            b"<!-- MARKER-COMMENT: BEGIN\n"
+            b"       first\n"
+            b"    \n"
+            b"     \tsecond\n"
+            b"     third\n"
+            b"     MARKER-COMMENT: END -->\n"
+        )
+        html_crlf = html_lf.replace(b"\n", b"\r\n")
+        self.assertEqual(
+            (self.repository / "document.xml").read_bytes(),
+            b'<?xml version="1.0"?>\r\n'
+            + html_crlf
+            + b"<root>kept</root>\r\n",
+        )
+        self.assertEqual(
+            (self.repository / "later.xml").read_bytes(),
+            html_lf + fixtures["later.xml"],
+        )
+        self.assertEqual(
+            (self.repository / "empty.css").read_bytes(),
+            b"/* MARKER-COMMENT: BEGIN\n"
+            b" *   first\n"
+            b" *\n"
+            b" * \tsecond\n"
+            b" * third\n"
+            b" * MARKER-COMMENT: END */\n",
+        )
+        self.assertEqual(
+            (self.repository / "no-terminal.html").read_bytes(),
+            html_lf + fixtures["no-terminal.html"],
+        )
+
+    def test_unsafe_block_content_errors_per_file_and_keeps_a_partial_patch(
+        self,
+    ) -> None:
+        fixtures = {
+            "page.html": b"<main>kept</main>\n",
+            "style.css": b"main { display: block; }\n",
+            "valid.py": b"print('kept')\n",
+        }
+        for path, content in fixtures.items():
+            self.add_bytes_at_head(path, content)
+
+        cases = [
+            (("--marker-text", "body--unsafe"), "page.html", "--"),
+            (("--marker-text", "body*/unsafe"), "style.css", "*/"),
+            (
+                (
+                    "--marker-text",
+                    "Managed",
+                    "--begin-sentinel",
+                    "BEGIN--unsafe",
+                ),
+                "page.html",
+                "--",
+            ),
+            (
+                (
+                    "--marker-text",
+                    "Managed",
+                    "--end-sentinel",
+                    "END*/unsafe",
+                ),
+                "style.css",
+                "*/",
+            ),
+        ]
+
+        for arguments, unsafe_path, forbidden in cases:
+            with self.subTest(arguments=arguments):
+                result = self.run_processor(*arguments)
+
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn(
+                    "Summary: discovered=3 eligible=3 changed=2 "
+                    "excluded=0 errored=1",
+                    result.stdout,
+                )
+                self.assertIn("Errors", result.stdout)
+                self.assertIn(
+                    f"- {unsafe_path}: comment syntax does not allow {forbidden!r}",
+                    result.stdout,
+                )
+                self.assertEqual(
+                    (self.repository / unsafe_path).read_bytes(),
+                    fixtures[unsafe_path],
+                )
+                patch = self.repository / "marker-comment.patch"
+                self.assertTrue(patch.exists())
+                self.git("restore", *fixtures)
+                self.git("apply", "--check", "marker-comment.patch")
+                patch.unlink()
 
     def test_invalid_globs_are_rejected_before_processing_and_name_the_pattern(
         self,
